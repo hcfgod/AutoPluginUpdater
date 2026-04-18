@@ -1,0 +1,16 @@
+name: AutoPluginUpdater
+version: '${version}'
+main: me.bestdad.autoPluginUpdater.AutoPluginUpdater
+api-version: '1.21'
+description: Admin-approved staged plugin updates for Paper servers.
+
+commands:
+  apu:
+    description: Open the AutoPluginUpdater admin UI or manage plugin updates.
+    usage: /apu [refresh|approve|deny|restart]
+    permission: autopluginupdater.admin
+
+permissions:
+  autopluginupdater.admin:
+    description: Allows admins to review and stage plugin updates.
+    default: op

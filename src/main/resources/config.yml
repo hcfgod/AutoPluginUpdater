@@ -1,0 +1,13 @@
+scan-interval-minutes: 60
+restart-command: "restart"
+http-timeout-seconds: 10
+
+managed-plugins:
+  VaultUnlocked:
+    source-type: "modrinth-project"
+    manifest-url: "https://api.modrinth.com/v2/project/vaultunlocked/version"
+    resource-url: "https://modrinth.com/plugin/vaultunlocked"
+    headers:
+      User-Agent: "keith/AutoPluginUpdater/0.1"
+    display-source: "Modrinth"
+    checksum-required: false
