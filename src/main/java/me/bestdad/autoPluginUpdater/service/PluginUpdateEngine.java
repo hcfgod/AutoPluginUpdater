@@ -177,7 +177,7 @@ public final class PluginUpdateEngine {
             try {
                 verifyChecksumIfNeeded(config, manifest, downloadedFile);
                 Path backupPath = backupLiveJar(installedPlugin.name(), liveJar);
-                Path stagedPath = stageUpdate(liveJar, downloadedFile, manifest);
+                Path stagedPath = stageUpdate(liveJar, installedPlugin.version(), downloadedFile, manifest);
                 Instant approvalTimestamp = Instant.now();
 
                 state.setLatestVersion(manifest.version());
@@ -448,18 +448,19 @@ public final class PluginUpdateEngine {
         return backupPath.toAbsolutePath().normalize();
     }
 
-    private Path stageUpdate(Path liveJar, Path downloadedFile, RemotePluginManifest manifest) throws IOException {
+    private Path stageUpdate(Path liveJar, String installedVersion, Path downloadedFile, RemotePluginManifest manifest)
+        throws IOException {
         Files.createDirectories(updateDirectory);
-        Path stagedPath = updateDirectory.resolve(resolveStagedFileName(liveJar, manifest));
+        Path stagedPath = updateDirectory.resolve(resolveStagedFileName(liveJar, installedVersion, manifest));
         Files.copy(downloadedFile, stagedPath, StandardCopyOption.REPLACE_EXISTING);
         return stagedPath.toAbsolutePath().normalize();
     }
 
-    private String resolveStagedFileName(Path liveJar, RemotePluginManifest manifest) {
+    private String resolveStagedFileName(Path liveJar, String installedVersion, RemotePluginManifest manifest) {
         String fallbackName = liveJar.getFileName().toString();
         String artifactName = manifest.fileName();
         if (artifactName == null || artifactName.isBlank()) {
-            return fallbackName;
+            return rewriteVersionInFileName(fallbackName, installedVersion, manifest.version());
         }
 
         String candidate = artifactName.trim().replace('\\', '/');
@@ -470,10 +471,34 @@ public final class PluginUpdateEngine {
 
         candidate = candidate.replaceAll("[:*?\"<>|]", "_");
         if (candidate.isBlank() || !candidate.toLowerCase(Locale.ROOT).endsWith(".jar")) {
-            return fallbackName;
+            return rewriteVersionInFileName(fallbackName, installedVersion, manifest.version());
         }
 
         return candidate;
+    }
+
+    private String rewriteVersionInFileName(String fileName, String installedVersion, String latestVersion) {
+        if (fileName == null || fileName.isBlank()) {
+            return fileName;
+        }
+        if (installedVersion == null || installedVersion.isBlank()
+            || latestVersion == null || latestVersion.isBlank()
+            || installedVersion.equals(latestVersion)) {
+            return fileName;
+        }
+
+        int extensionIndex = fileName.toLowerCase(Locale.ROOT).lastIndexOf(".jar");
+        if (extensionIndex < 0) {
+            return fileName;
+        }
+
+        String baseName = fileName.substring(0, extensionIndex);
+        String extension = fileName.substring(extensionIndex);
+        if (!baseName.contains(installedVersion)) {
+            return fileName;
+        }
+
+        return baseName.replace(installedVersion, latestVersion) + extension;
     }
 
     private void verifyChecksumIfNeeded(ManagedPluginConfig config, RemotePluginManifest manifest, Path downloadedFile)
@@ -502,9 +527,30 @@ public final class PluginUpdateEngine {
     }
 
     private void validateManifest(InstalledPlugin installedPlugin, RemotePluginManifest manifest) throws IOException {
-        if (manifest.name() != null && !installedPlugin.identifiers().contains(normalize(manifest.name()))) {
+        if (manifest.name() != null && !manifestNameMatches(installedPlugin, manifest.name())) {
             throw new IOException("Manifest name " + manifest.name() + " does not match " + installedPlugin.name() + ".");
         }
+    }
+
+    private boolean manifestNameMatches(InstalledPlugin installedPlugin, String manifestName) {
+        String normalizedManifestName = normalize(manifestName);
+        String compactManifestName = compact(normalizedManifestName);
+        for (String identifier : installedPlugin.identifiers()) {
+            if (identifier.equals(normalizedManifestName)) {
+                return true;
+            }
+
+            String compactIdentifier = compact(identifier);
+            if (compactIdentifier.isBlank() || compactManifestName.isBlank()) {
+                continue;
+            }
+            if (compactManifestName.equals(compactIdentifier)
+                || compactManifestName.startsWith(compactIdentifier)
+                || compactIdentifier.startsWith(compactManifestName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String resolveSourceLabel(ManagedPluginConfig config) {
@@ -529,6 +575,10 @@ public final class PluginUpdateEngine {
 
     private static String normalize(String value) {
         return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static String compact(String value) {
+        return normalize(value).replaceAll("[^a-z0-9]", "");
     }
 
     private static String sanitize(String value) {

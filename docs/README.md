@@ -22,18 +22,18 @@ restart when the update is ready to apply.
   `VaultUnlocked-2.18.0.jar` loading as plugin name `Vault`.
 - A full server restart is still required for the staged update to apply.
 
-## Recommended Source
+## Choosing a Source
 
-`modrinth-project` is the recommended source type for most plugins.
+AutoPluginUpdater supports whichever source you want to use for a managed plugin.
 
-Why Modrinth is recommended:
+Current built-in choices:
 
-- It has a public API that is straightforward to query.
-- Its downloadable files are easier to fetch from a server without browser-only protections.
-- It provides the actual artifact filename, so staged jars can keep the correct new version in the filename.
+- `modrinth-project`
+- `spigot-resource`
+- `http-manifest`
 
-`spigot-resource` is still supported for update checks, but automated jar downloads may fail with `HTTP 403`
-depending on Spigot's anti-bot or authentication requirements. Use Modrinth when the plugin is available there.
+Both `modrinth-project` and `spigot-resource` are fully supported and can work well. Use the source that makes the
+most sense for the plugin you are managing and the site you prefer to pull updates from.
 
 ## Installation
 
@@ -83,7 +83,7 @@ Per-plugin settings:
 
 ### `modrinth-project`
 
-Best default choice when available.
+Use this when you want to read versions directly from Modrinth.
 
 - `manifest-url` should point to the Modrinth versions API for the project.
 - `resource-url` should point to the public Modrinth project page.
@@ -133,7 +133,7 @@ Expected manifest shape:
 
 ### `spigot-resource`
 
-Use this only when there is no better public source.
+Use this when you want to manage updates from the plugin's Spigot resource page.
 
 Example:
 
@@ -153,8 +153,10 @@ managed-plugins:
 Note:
 
 - Spigot resource pages can work for update detection.
-- Direct jar downloads may still fail with `HTTP 403`.
-- If that happens, switch the plugin to Modrinth or another source you control.
+- AutoPluginUpdater will first try the direct Spigot jar URL.
+- If Spigot blocks that request, AutoPluginUpdater will try Spiget's cached download endpoint for the same resource.
+- Spiget data is not instant; its public site says it updates from Spigot every 2 hours.
+- If you want a different source instead, switch the plugin to Modrinth or another source you control.
 
 ## Commands
 
@@ -221,7 +223,9 @@ Tracked metadata includes:
 ### Approval fails with `HTTP 403`
 
 - This is most common with `spigot-resource`.
-- Switch to `modrinth-project` if the plugin is available on Modrinth.
+- AutoPluginUpdater now retries through Spiget automatically for supported Spigot resources.
+- If the fallback still fails, it may mean Spiget has not cached the newest file yet.
+- Try again later or switch to another supported source if you prefer.
 - If you must use a protected source, add the required headers in config.
 
 ### The update is staged but not live yet
@@ -231,7 +235,8 @@ Tracked metadata includes:
 
 ## Recommended Workflow
 
-1. Prefer `modrinth-project` whenever the plugin is published on Modrinth.
-2. Use `http-manifest` for private plugins or plugins you distribute yourself.
-3. Use `spigot-resource` only as a fallback.
-4. Always test updates on a non-production server first when possible.
+1. Pick the source you actually want to manage updates from for each plugin.
+2. Use `modrinth-project` for plugins you want to track through Modrinth.
+3. Use `spigot-resource` for plugins you want to track through Spigot.
+4. Use `http-manifest` for private plugins or plugins you distribute yourself.
+5. Always test updates on a non-production server first when possible.

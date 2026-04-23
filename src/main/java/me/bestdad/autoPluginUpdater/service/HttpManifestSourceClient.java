@@ -21,10 +21,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public final class HttpManifestSourceClient implements ManifestSourceClient {
+    private static final String DEFAULT_SPIGET_API_BASE = "https://api.spiget.org/v2/resources/";
     private static final Pattern SPIGOT_TITLE_PATTERN = Pattern.compile(
         "<h1>\\s*(?<name>[^<]+?)\\s*<span[^>]*>\\s*(?<version>[^<]+?)\\s*</span>\\s*</h1>",
         Pattern.CASE_INSENSITIVE | Pattern.DOTALL
@@ -37,14 +39,24 @@ public final class HttpManifestSourceClient implements ManifestSourceClient {
         "href=\"(?<href>[^\"]*download\\?version=\\d+[^\"]*)\"",
         Pattern.CASE_INSENSITIVE
     );
+    private static final Pattern SPIGOT_RESOURCE_ID_PATTERN = Pattern.compile(
+        "/resources/(?:[^./]+\\.)?(?<id>\\d+)(?:[/?#]|$)",
+        Pattern.CASE_INSENSITIVE
+    );
     private static final String DEFAULT_USER_AGENT = "Mozilla/5.0 AutoPluginUpdater/0.1";
 
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
     private final Duration timeout;
+    private final String spigetApiBase;
 
     public HttpManifestSourceClient(Duration timeout) {
+        this(timeout, DEFAULT_SPIGET_API_BASE);
+    }
+
+    HttpManifestSourceClient(Duration timeout, String spigetApiBase) {
         this.timeout = timeout;
+        this.spigetApiBase = spigetApiBase.endsWith("/") ? spigetApiBase : spigetApiBase + "/";
         this.httpClient = HttpClient.newBuilder()
             .cookieHandler(new CookieManager())
             .connectTimeout(timeout)
@@ -79,30 +91,98 @@ public final class HttpManifestSourceClient implements ManifestSourceClient {
             throw new IOException("No download URL is available for " + config.pluginName() + ".");
         }
 
-        HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(downloadUri)
-            .timeout(timeout)
-            .GET();
-        if (config.sourceType() == ManagedPluginSourceType.SPIGOT_RESOURCE && !config.resourceUrl().isBlank()) {
-            requestBuilder.header("Referer", config.resourceUrl());
-        }
-
-        HttpRequest request = applyHeaders(requestBuilder, config.headers())
-            .build();
-
-        HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            Files.deleteIfExists(tempFile);
-            throw new IOException("Download request failed with HTTP " + response.statusCode());
-        }
-
-        try (InputStream inputStream = response.body()) {
-            Files.copy(inputStream, tempFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        try {
+            DownloadResult directResult = downloadToFile(downloadUri, tempFile, config.headers(), refererFor(config, downloadUri));
+            if (!directResult.success()) {
+                DownloadResult fallbackResult = maybeDownloadViaSpiget(config, manifest, tempFile, directResult.statusCode());
+                if (!fallbackResult.success()) {
+                    throw buildDownloadFailure(config, manifest, directResult.statusCode(), fallbackResult);
+                }
+            }
         } catch (IOException exception) {
             Files.deleteIfExists(tempFile);
             throw exception;
         }
 
         return tempFile;
+    }
+
+    private DownloadResult downloadToFile(URI uri, Path targetFile, Map<String, String> headers, String referer)
+        throws IOException, InterruptedException {
+        HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(uri)
+            .timeout(timeout)
+            .GET();
+        if (referer != null && !referer.isBlank()) {
+            requestBuilder.header("Referer", referer);
+        }
+
+        HttpRequest request = applyHeaders(requestBuilder, headers).build();
+        HttpResponse<InputStream> response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            try (InputStream ignored = response.body()) {
+                return DownloadResult.failure(response.statusCode(), uri);
+            }
+        }
+
+        try (InputStream inputStream = response.body()) {
+            Files.copy(inputStream, targetFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+        return DownloadResult.success(uri);
+    }
+
+    private DownloadResult maybeDownloadViaSpiget(
+        ManagedPluginConfig config,
+        RemotePluginManifest manifest,
+        Path targetFile,
+        int directStatusCode
+    ) throws IOException, InterruptedException {
+        if (config.sourceType() != ManagedPluginSourceType.SPIGOT_RESOURCE || directStatusCode < 400) {
+            return DownloadResult.skippedResult();
+        }
+
+        Optional<String> resourceId = parseSpigotResourceId(config);
+        if (resourceId.isEmpty()) {
+            return DownloadResult.skippedResult();
+        }
+
+        SpigetVersionPayload latestVersion = fetchSpigetLatestVersion(resourceId.get());
+        if (latestVersion == null || isBlank(latestVersion.name())) {
+            return DownloadResult.failure(-1, URI.create(spigetApiBase + resourceId.get() + "/versions/latest"));
+        }
+        if (!isSameSpigotVersion(latestVersion.name(), manifest.version())) {
+            return DownloadResult.versionMismatch(latestVersion.name(), URI.create(spigetApiBase + resourceId.get() + "/download"));
+        }
+
+        URI spigetDownloadUri = URI.create(spigetApiBase + resourceId.get() + "/download");
+        return downloadToFile(spigetDownloadUri, targetFile, userAgentOnlyHeaders(config.headers()), null);
+    }
+
+    private IOException buildDownloadFailure(
+        ManagedPluginConfig config,
+        RemotePluginManifest manifest,
+        int directStatusCode,
+        DownloadResult fallbackResult
+    ) {
+        if (config.sourceType() != ManagedPluginSourceType.SPIGOT_RESOURCE || fallbackResult.skipped()) {
+            return new IOException("Download request failed with HTTP " + directStatusCode);
+        }
+        if (fallbackResult.versionMismatchVersion() != null) {
+            return new IOException(
+                "Download request failed with HTTP " + directStatusCode
+                    + ". Spiget fallback still reports version " + fallbackResult.versionMismatchVersion()
+                    + " while Spigot shows " + manifest.version() + "."
+            );
+        }
+        if (fallbackResult.statusCode() > 0) {
+            return new IOException(
+                "Download request failed with HTTP " + directStatusCode
+                    + ". Spiget fallback returned HTTP " + fallbackResult.statusCode() + "."
+            );
+        }
+        return new IOException(
+            "Download request failed with HTTP " + directStatusCode
+                + ". Spiget fallback was unavailable for this resource."
+        );
     }
 
     private RemotePluginManifest fetchHttpManifest(ManagedPluginConfig config) throws IOException, InterruptedException {
@@ -157,6 +237,20 @@ public final class HttpManifestSourceClient implements ManifestSourceClient {
             URI.create(config.resourceUrl()),
             null
         );
+    }
+
+    private SpigetVersionPayload fetchSpigetLatestVersion(String resourceId) throws IOException, InterruptedException {
+        URI uri = URI.create(spigetApiBase + resourceId + "/versions/latest");
+        HttpRequest request = applyHeaders(HttpRequest.newBuilder(uri)
+            .timeout(timeout)
+            .GET(), userAgentOnlyHeaders(Map.of()))
+            .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            return null;
+        }
+        return objectMapper.readValue(response.body(), SpigetVersionPayload.class);
     }
 
     private RemotePluginManifest fetchModrinthProject(ManagedPluginConfig config) throws IOException, InterruptedException {
@@ -269,12 +363,53 @@ public final class HttpManifestSourceClient implements ManifestSourceClient {
         return null;
     }
 
+    private Optional<String> parseSpigotResourceId(ManagedPluginConfig config) {
+        String[] candidates = {config.resourceUrl(), config.downloadUrl()};
+        for (String candidate : candidates) {
+            if (isBlank(candidate)) {
+                continue;
+            }
+            Matcher matcher = SPIGOT_RESOURCE_ID_PATTERN.matcher(candidate);
+            if (matcher.find()) {
+                return Optional.of(matcher.group("id"));
+            }
+        }
+        return Optional.empty();
+    }
+
+    private String refererFor(ManagedPluginConfig config, URI downloadUri) {
+        if (config.sourceType() != ManagedPluginSourceType.SPIGOT_RESOURCE || config.resourceUrl().isBlank()) {
+            return null;
+        }
+
+        String host = downloadUri.getHost();
+        if (host != null && host.toLowerCase(Locale.ROOT).contains("spigotmc.org")) {
+            return config.resourceUrl();
+        }
+        return null;
+    }
+
     private boolean containsHeader(Map<String, String> headers, String headerName) {
         return headers.keySet().stream().anyMatch(key -> key.equalsIgnoreCase(headerName));
     }
 
+    private Map<String, String> userAgentOnlyHeaders(Map<String, String> headers) {
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            if (entry.getKey().equalsIgnoreCase("User-Agent") && !isBlank(entry.getValue())) {
+                return Map.of("User-Agent", entry.getValue());
+            }
+        }
+        return Map.of();
+    }
+
     private String sanitize(String value) {
         return value.replaceAll("[^A-Za-z0-9._-]", "_");
+    }
+
+    private boolean isSameSpigotVersion(String left, String right) {
+        return blankToNull(left) != null
+            && blankToNull(right) != null
+            && left.trim().equalsIgnoreCase(right.trim());
     }
 
     private static boolean isBlank(String value) {
@@ -311,6 +446,36 @@ public final class HttpManifestSourceClient implements ManifestSourceClient {
         Boolean primary,
         String filename
     ) {
+    }
+
+    private record SpigetVersionPayload(
+        String name,
+        Integer id
+    ) {
+    }
+
+    private record DownloadResult(
+        boolean success,
+        boolean skipped,
+        int statusCode,
+        URI uri,
+        String versionMismatchVersion
+    ) {
+        private static DownloadResult success(URI uri) {
+            return new DownloadResult(true, false, 200, uri, null);
+        }
+
+        private static DownloadResult failure(int statusCode, URI uri) {
+            return new DownloadResult(false, false, statusCode, uri, null);
+        }
+
+        private static DownloadResult skippedResult() {
+            return new DownloadResult(false, true, -1, null, null);
+        }
+
+        private static DownloadResult versionMismatch(String version, URI uri) {
+            return new DownloadResult(false, false, -1, uri, version);
+        }
     }
 
     private String inferModrinthProjectName(ManagedPluginConfig config, String versionName) {

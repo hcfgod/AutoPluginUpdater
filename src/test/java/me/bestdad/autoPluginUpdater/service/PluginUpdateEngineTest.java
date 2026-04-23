@@ -83,9 +83,10 @@ class PluginUpdateEngineTest {
 
         assertTrue(engine.approveUpdate(installedPlugin).success());
 
-        Path stagedJar = updateDir.resolve(liveJar.getFileName());
+        Path stagedJar = updateDir.resolve("ExamplePlugin-2.0.0.jar");
         assertTrue(Files.exists(stagedJar));
         assertEquals("new-jar", Files.readString(stagedJar));
+        assertFalse(Files.exists(updateDir.resolve("ExamplePlugin-1.0.0.jar")));
 
         Path backupDir = pluginsDir.resolve("backup").resolve("ExamplePlugin");
         assertTrue(Files.exists(backupDir));
@@ -176,7 +177,108 @@ class PluginUpdateEngineTest {
         assertTrue(engine.refreshAll(List.of(installedPlugin)).success());
         assertEquals(PluginUpdateStatus.UPDATE_AVAILABLE, engine.getPluginView("VaultUnlocked", List.of(installedPlugin)).orElseThrow().status());
         assertTrue(engine.approveUpdate(installedPlugin).success());
-        assertEquals("spigot-new-jar", Files.readString(updateDir.resolve("VaultUnlocked-2.18.0.jar")));
+        assertEquals("spigot-new-jar", Files.readString(updateDir.resolve("VaultUnlocked-2.19.0.jar")));
+        assertFalse(Files.exists(updateDir.resolve("VaultUnlocked-2.18.0.jar")));
+    }
+
+    @Test
+    void acceptsSpigotResourceTitlesThatStartWithPluginName() throws Exception {
+        Path pluginsDir = tempDir.resolve("plugins-spigot-title");
+        Path dataDir = tempDir.resolve("data-spigot-title");
+        Path updateDir = pluginsDir.resolve("update");
+        Files.createDirectories(pluginsDir);
+        Path liveJar = pluginsDir.resolve("OldCombatMechanics.jar");
+        Files.writeString(liveJar, "old-jar");
+
+        server.createContext("/resources/oldcombatmechanics.19510/", exchange -> respondHtml(exchange, """
+            <html>
+              <body>
+                <h1>OldCombatMechanics - Disable 1.9 hit cooldown <span class="muted">1.12.8</span></h1>
+                <a href="download?version=12345">Download Now</a>
+              </body>
+            </html>
+            """));
+
+        UpdateMetadataStore metadataStore = new UpdateMetadataStore(dataDir.resolve("updates.yml"));
+        metadataStore.load();
+        YamlConfiguration configuration = new YamlConfiguration();
+        configuration.set("managed-plugins.OldCombatMechanics.source-type", "spigot-resource");
+        configuration.set("managed-plugins.OldCombatMechanics.resource-url", baseUrl + "/resources/oldcombatmechanics.19510/");
+        configuration.set("managed-plugins.OldCombatMechanics.display-source", "SpigotMC");
+        configuration.set("managed-plugins.OldCombatMechanics.headers", Map.of());
+
+        PluginUpdateEngine engine = new PluginUpdateEngine(
+            ManagedPluginRegistry.fromConfig(configuration),
+            metadataStore,
+            new HttpManifestSourceClient(java.time.Duration.ofSeconds(5)),
+            new VersionService(),
+            dataDir,
+            pluginsDir,
+            updateDir,
+            () -> {}
+        );
+
+        InstalledPlugin installedPlugin = new InstalledPlugin("OldCombatMechanics", "1.12.7", true, liveJar);
+        assertTrue(engine.refreshAll(List.of(installedPlugin)).success());
+        assertEquals(
+            PluginUpdateStatus.UPDATE_AVAILABLE,
+            engine.getPluginView("OldCombatMechanics", List.of(installedPlugin)).orElseThrow().status()
+        );
+    }
+
+    @Test
+    void fallsBackToSpigetWhenSpigotDirectDownloadIsBlocked() throws Exception {
+        byte[] newJarBytes = "spiget-new-jar".getBytes(StandardCharsets.UTF_8);
+
+        Path pluginsDir = tempDir.resolve("plugins-spiget-fallback");
+        Path dataDir = tempDir.resolve("data-spiget-fallback");
+        Path updateDir = pluginsDir.resolve("update");
+        Files.createDirectories(pluginsDir);
+        Path liveJar = pluginsDir.resolve("VaultUnlocked-2.18.0.jar");
+        Files.writeString(liveJar, "old-jar");
+
+        server.createContext("/resources/vaultunlocked.117277/", exchange -> respondHtml(exchange, """
+            <html>
+              <body>
+                <h1>VaultUnlocked <span class="muted">2.19.0</span></h1>
+                <a href="download?version=625066">Download Now</a>
+              </body>
+            </html>
+            """));
+        server.createContext("/resources/vaultunlocked.117277/download", exchange -> respondStatus(exchange, 403, "challenge"));
+        server.createContext("/api/spiget/resources/117277/versions/latest", exchange -> respondJson(exchange, """
+            {
+              "name": "2.19.0",
+              "id": 625066
+            }
+            """));
+        server.createContext("/api/spiget/resources/117277/download", exchange -> respondBytes(exchange, newJarBytes, "application/java-archive"));
+
+        UpdateMetadataStore metadataStore = new UpdateMetadataStore(dataDir.resolve("updates.yml"));
+        metadataStore.load();
+        YamlConfiguration configuration = new YamlConfiguration();
+        configuration.set("managed-plugins.VaultUnlocked.source-type", "spigot-resource");
+        configuration.set("managed-plugins.VaultUnlocked.resource-url", baseUrl + "/resources/vaultunlocked.117277/");
+        configuration.set("managed-plugins.VaultUnlocked.display-source", "SpigotMC");
+        configuration.set("managed-plugins.VaultUnlocked.headers", Map.of());
+
+        PluginUpdateEngine engine = new PluginUpdateEngine(
+            ManagedPluginRegistry.fromConfig(configuration),
+            metadataStore,
+            new HttpManifestSourceClient(java.time.Duration.ofSeconds(5), baseUrl + "/api/spiget/resources/"),
+            new VersionService(),
+            dataDir,
+            pluginsDir,
+            updateDir,
+            () -> {}
+        );
+
+        InstalledPlugin installedPlugin = new InstalledPlugin("Vault", "2.18.0", true, liveJar);
+        assertTrue(engine.refreshAll(List.of(installedPlugin)).success());
+        assertEquals(PluginUpdateStatus.UPDATE_AVAILABLE, engine.getPluginView("VaultUnlocked", List.of(installedPlugin)).orElseThrow().status());
+        assertTrue(engine.approveUpdate(installedPlugin).success());
+        assertEquals("spiget-new-jar", Files.readString(updateDir.resolve("VaultUnlocked-2.19.0.jar")));
+        assertFalse(Files.exists(updateDir.resolve("VaultUnlocked-2.18.0.jar")));
     }
 
     @Test
@@ -355,6 +457,15 @@ class PluginUpdateEngineTest {
         exchange.sendResponseHeaders(200, response.length);
         try (var output = exchange.getResponseBody()) {
             output.write(response);
+        }
+    }
+
+    private void respondStatus(HttpExchange exchange, int statusCode, String response) throws IOException {
+        byte[] body = response.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().add("Content-Type", "text/plain");
+        exchange.sendResponseHeaders(statusCode, body.length);
+        try (var output = exchange.getResponseBody()) {
+            output.write(body);
         }
     }
 }

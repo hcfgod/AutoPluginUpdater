@@ -132,6 +132,49 @@ class HttpManifestSourceClientTest {
     }
 
     @Test
+    void fallsBackToSpigetWhenSpigotDirectDownloadIsBlocked() throws Exception {
+        byte[] jarBytes = "spiget-jar".getBytes(StandardCharsets.UTF_8);
+        server.createContext("/resources/example.1234/", exchange -> respondHtml(exchange, """
+            <html>
+              <body>
+                <h1>ExamplePlugin <span class="muted">2.5.0</span></h1>
+                <a class="button" href="download?version=42">Download Now</a>
+              </body>
+            </html>
+            """));
+        server.createContext("/resources/example.1234/download", exchange -> respondStatus(exchange, 403, "blocked by challenge"));
+        server.createContext("/api/spiget/resources/1234/versions/latest", exchange -> respondJson(exchange, """
+            {
+              "name": "2.5.0",
+              "id": 42
+            }
+            """));
+        server.createContext("/api/spiget/resources/1234/download", exchange -> respondBytes(exchange, jarBytes, "application/java-archive"));
+
+        ManagedPluginConfig config = new ManagedPluginConfig(
+            "ExamplePlugin",
+            ManagedPluginSourceType.SPIGOT_RESOURCE,
+            "",
+            baseUrl + "/resources/example.1234/",
+            "",
+            Map.of(),
+            "SpigotMC",
+            false
+        );
+
+        HttpManifestSourceClient fallbackClient = new HttpManifestSourceClient(
+            Duration.ofSeconds(5),
+            baseUrl + "/api/spiget/resources/"
+        );
+
+        RemotePluginManifest manifest = fallbackClient.fetchManifest(config);
+        Path downloaded = fallbackClient.downloadArtifact(config, manifest, tempDir);
+
+        assertEquals("2.5.0", manifest.version());
+        assertEquals("spiget-jar", Files.readString(downloaded));
+    }
+
+    @Test
     void parsesModrinthVersionsApiAndDownloadsPrimaryFile() throws Exception {
         byte[] jarBytes = "modrinth-jar".getBytes(StandardCharsets.UTF_8);
         server.createContext("/modrinth/project/example/version", exchange -> respondJson(exchange, """
@@ -189,6 +232,15 @@ class HttpManifestSourceClientTest {
         exchange.sendResponseHeaders(200, response.length);
         try (var output = exchange.getResponseBody()) {
             output.write(response);
+        }
+    }
+
+    private void respondStatus(HttpExchange exchange, int statusCode, String response) throws IOException {
+        byte[] body = response.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().add("Content-Type", "text/plain");
+        exchange.sendResponseHeaders(statusCode, body.length);
+        try (var output = exchange.getResponseBody()) {
+            output.write(body);
         }
     }
 }
